@@ -1,0 +1,139 @@
+# A CI/CD pipeline with a security gate at every stage.
+# Audit mode (default): every scan runs and reports, but nothing blocks the pipeline.
+# Enforce mode: set ENFORCE_GATES to "true" and any finding fails the pipeline.
+
+name: Secure pipeline demo
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  ENFORCE_GATES: "false"
+  IMAGE: demo-app:${{ github.sha }}
+
+permissions:
+  contents: read
+  security-events: write   # lets SARIF results appear in the repo's Security tab
+
+jobs:
+  # ---------- Code stage: SAST (our own code) ----------
+  sast:
+    name: SAST (Semgrep)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: pip install semgrep
+      - name: Scan source code
+        continue-on-error: ${{ env.ENFORCE_GATES != 'true' }}
+        run: |
+          mkdir -p reports
+          semgrep scan --metrics=off --error \
+            --config p/python --config p/flask --config .semgrep/rules.yml \
+            --sarif -o reports/semgrep.sarif app/
+      - name: Show results in the Security tab
+        if: always()
+        continue-on-error: true   # needs a public repo or GitHub Advanced Security
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: reports/semgrep.sarif
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: sast-report, path: reports/ }
+
+  # ---------- Build stage: SCA (open-source dependencies) ----------
+  sca:
+    name: SCA (pip-audit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: pip install pip-audit
+      - name: Check dependencies for known CVEs
+        continue-on-error: ${{ env.ENFORCE_GATES != 'true' }}
+        run: |
+          mkdir -p reports
+          pip-audit -r app/requirements.txt -f json -o reports/pip-audit.json
+      - name: Summary
+        if: always()
+        run: |
+          python3 - <<'EOF' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          d = json.load(open("reports/pip-audit.json"))
+          print("### SCA: vulnerable dependencies\n\n| Package | Version | Known vulns |\n|---|---|---|")
+          for dep in d["dependencies"]:
+              if dep.get("vulns"):
+                  print(f"| {dep['name']} | {dep.get('version')} | {len({v['id'] for v in dep['vulns']})} |")
+          EOF
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: sca-report, path: reports/ }
+
+  # ---------- Infrastructure: IaC scanning ----------
+  iac:
+    name: IaC scan (Checkov)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: pip install checkov
+      - name: Scan Terraform
+        continue-on-error: ${{ env.ENFORCE_GATES != 'true' }}
+        run: |
+          mkdir -p reports
+          checkov -d terraform --framework terraform --compact \
+            -o cli -o json --output-file-path console,reports/checkov.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: iac-report, path: reports/ }
+
+  # ---------- Build -> Test: container scan, SBOM, DAST ----------
+  build-and-test:
+    name: Container scan, SBOM and DAST
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the container image
+        run: docker build -t "$IMAGE" app
+
+      - name: Container scan (Trivy)
+        continue-on-error: ${{ env.ENFORCE_GATES != 'true' }}
+        run: |
+          mkdir -p reports
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$PWD/reports:/reports" aquasec/trivy:latest image \
+            --severity HIGH,CRITICAL --exit-code 1 \
+            --format table -o /reports/trivy.txt "$IMAGE"
+
+      - name: Generate SBOM (Syft)
+        if: always()
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$PWD/reports:/reports" anchore/syft:latest "$IMAGE" \
+            -o cyclonedx-json=/reports/sbom.cyclonedx.json
+
+      - name: Start the app for DAST
+        if: always()
+        run: |
+          docker run -d --name app -p 5000:5000 "$IMAGE"
+          for i in $(seq 1 30); do curl -sf http://localhost:5000 && break; sleep 2; done
+
+      - name: DAST (OWASP ZAP full scan)
+        if: always()
+        continue-on-error: ${{ env.ENFORCE_GATES != 'true' }}
+        run: |
+          docker run --rm --network host --user root \
+            -v "$PWD/reports:/zap/wrk/:rw" ghcr.io/zaproxy/zaproxy:stable \
+            zap-full-scan.py -t http://localhost:5000 -m 2 \
+            -r zap-report.html -J zap-report.json
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Container scan (HIGH and CRITICAL)"
+            echo '```'; head -n 40 reports/trivy.txt 2>/dev/null; echo '```'
+            echo "### DAST: open the zap-report.html artifact for details"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: build-and-test-reports, path: reports/ }
